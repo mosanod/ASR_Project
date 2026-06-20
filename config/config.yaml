@@ -1,0 +1,190 @@
+# =============================================================================
+# Speaker-ID ASR Pipeline — Configuration (Single Source of Truth)
+# All paths are relative to container /app unless absolute.
+# Validated by pydantic-settings on startup.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Application
+# -----------------------------------------------------------------------------
+app:
+  name: "speaker-id-asr-pipeline"
+  version: "3.0.0"
+  log_level: "INFO"           # DEBUG, INFO, WARNING, ERROR
+  log_format: "json"          # json | console
+  max_calls_before_restart: 20  # Process rotation: restart container after N calls
+  warmup_on_start: true       # Run dummy inference to load models into VRAM
+
+# -----------------------------------------------------------------------------
+# Paths (inside container)
+# -----------------------------------------------------------------------------
+paths:
+  models_dir: "./models"
+  data_dir: "./data"
+  input_dir: "./data/input"
+  output_dir: "./data/output"
+  known_voices_dir: "./known_voices"
+  qdrant_storage: "./qdrant_storage"
+  prompts_dir: "./prompts"
+  processed_calls_log: "./data/processed_calls.json"
+  processed_enrollments_log: "./data/processed_enrollments.json"
+
+# -----------------------------------------------------------------------------
+# ASR (Faster-Whisper)
+# -----------------------------------------------------------------------------
+asr:
+  model: "large-v3"
+  language: "ru"
+  beam_size: 5
+  compute_type: "float16"        # float16 | int8_float16 | int8
+  device: "cpu"                 # Changed to cpu for local testing
+  initial_prompt_template: "Разговор между менеджером и клиентом. Имена: {names}. Термины: {terms}."
+  project_terms: []              # Domain-specific terms to boost recognition
+  vad_filter: true               # Use Whisper's internal VAD for segment splitting
+  params:
+    threshold: 0.5
+    min_speech_duration_ms: 250
+    max_speech_duration_s: 30
+    min_silence_duration_ms: 100
+
+# -----------------------------------------------------------------------------
+# Alignment (torchaudio CTC forced alignment — CPU)
+# -----------------------------------------------------------------------------
+alignment:
+  model: "wav2vec2_base"         # torchaudio pipeline model identifier
+  device: "cpu"                  # Keep on CPU to save VRAM
+  batch_size: 16
+
+# -----------------------------------------------------------------------------
+# VAD (Silero) — used for diarization segmentation
+# -----------------------------------------------------------------------------
+vad:
+  model: "silero_vad"
+  threshold: 0.5
+  min_speech_duration_ms: 500
+  min_silence_duration_ms: 200
+  segment_padding_ms: 100
+  device: "cpu"                 # Changed to cpu for local testing
+
+# -----------------------------------------------------------------------------
+# Diarization / Speaker Embeddings (NeMo TitaNet)
+# -----------------------------------------------------------------------------
+diarization:
+  embedding_model: "nvidia/ctn-titanet_large"  # 192-dim
+  # embedding_model: "ecapa_tdnn"              # Alternative: 512-dim, better for short segments
+  batch_size: 32
+  device: "cpu"                 # Changed to cpu for local testing
+  base_similarity_threshold: 0.75
+  use_dynamic_threshold: true
+  dynamic_threshold_multiplier: 2.5      # threshold = max(base, min_dist * multiplier)
+  phone_match_bonus: 0.10                # Subtracted from cosine distance for expected phone
+  min_segment_duration_sec: 0.5          # Filter segments shorter than this
+  max_segment_duration_sec: 30.0         # Split longer segments
+
+# -----------------------------------------------------------------------------
+# Unknown Speaker Clustering (Optional)
+# -----------------------------------------------------------------------------
+clustering:
+  enable_unknown_clustering: true
+  min_unknown_segments: 15               # Only cluster if > N unknown segments
+  distance_threshold: 0.5
+  linkage: "average"                     # ward | complete | average | single
+
+# -----------------------------------------------------------------------------
+# Merger (IoU + VAD-aware grouping)
+# -----------------------------------------------------------------------------
+merger:
+  max_pause_ms: 1000                     # Max pause to merge words into utterance
+  overlap_tolerance: 0.15                # Zone around 50/50 IoU -> [OVERLAP]
+  vad_aware_grouping: true               # Don't split on VAD-silence pauses
+
+# -----------------------------------------------------------------------------
+# LLM Post-Processing (Local GGUF via llama-cpp-python)
+# -----------------------------------------------------------------------------
+llm:
+  enabled: false                  # Disabled for local testing
+  model_path: "./models/llm/model.gguf"  # Place your GGUF here
+  n_ctx: 8192
+  n_gpu_layers: -1              # -1 = all layers on GPU, 0 = CPU only
+  temperature: 0.0              # Deterministic for correction tasks
+  top_p: 0.95
+  repeat_penalty: 1.1
+  system_prompt_path: "./prompts/refine.txt"
+  max_tokens: 2048
+  # Circuit breaker
+  circuit_breaker:
+    enabled: true
+    failure_threshold: 5
+    recovery_timeout_seconds: 600
+
+# -----------------------------------------------------------------------------
+# Rule-based Post-Processing (Fast, deterministic)
+# -----------------------------------------------------------------------------
+rules:
+  enabled: true
+  filler_words:
+    - "ээ"
+    - "эээ"
+    - "ну"
+    - "как бы"
+    - "тоже"
+    - "короче"
+    - "типа"
+    - "кстати"
+  uncertain_confidence_threshold: 0.5  # Words below this -> [UNCERTAIN:word]
+
+# -----------------------------------------------------------------------------
+# Learning Loop (Profile Enrichment)
+# -----------------------------------------------------------------------------
+learning:
+  enable_feedback_loop: true
+  min_confidence_to_enroll: 0.85       # Only enrich if speaker confidence >= this
+  min_segment_duration_sec: 2.0        # Minimum audio duration for new embedding
+  min_vector_norm: 0.7                 # Reject embeddings with norm < this
+  update_strategy: "multi_vector"      # Only multi_vector supported (centroid removed)
+  max_vectors_per_speaker: 50          # FIFO eviction for learned vectors
+  protect_enrolled_vectors: true       # Never evict vectors with vector_type="enrolled"
+
+# -----------------------------------------------------------------------------
+# Qdrant Vector Database
+# -----------------------------------------------------------------------------
+qdrant:
+  host: "localhost"                # Changed to localhost for local testing
+  port: 6333
+  grpc_port: 6334
+  prefer_grpc: true
+  collections:
+    production: "speakers_prod"
+    staging: "speakers_staging"
+  vector_size: 192                     # Must match embedding model (TitaNet=192, ECAPA=512)
+  distance: "Cosine"
+  hnsw_config:
+    m: 16
+    ef_construct: 100
+    full_scan_threshold: 10000
+  payload_indexes:
+    - "phone"
+    - "speaker_id"
+    - "is_admin"
+    - "vector_type"
+  staging_ttl_hours: 24                # Auto-cleanup for Unknown clusters
+
+# -----------------------------------------------------------------------------
+# Redis (Locks, Idempotency, Cache)
+# -----------------------------------------------------------------------------
+redis:
+  host: "localhost"                # Changed to localhost for local testing
+  port: 6379
+  db: 0
+  lock_ttl_seconds: 3600
+  idempotency_ttl_days: 30
+
+# -----------------------------------------------------------------------------
+# Monitoring / Metrics (Prometheus)
+# -----------------------------------------------------------------------------
+monitoring:
+  enabled: true
+  port: 9090
+  path: "/metrics"
+  vram_log_interval_calls: 5           # Log torch.cuda.memory_summary() every N calls
+  vram_warning_threshold_gb: 1.5       # Warn if free VRAM < this

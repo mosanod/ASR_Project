@@ -1,0 +1,128 @@
+# =============================================================================
+# Speaker-ID ASR Pipeline — Docker Compose (Production)
+# Services: app (pipeline), qdrant (vector DB), redis (locks/cache)
+# =============================================================================
+version: "3.9"
+
+services:
+  # ---------------------------------------------------------------------------
+  # Main application — speaker-id pipeline
+  # ---------------------------------------------------------------------------
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: speaker-id-app
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CUDA_VISIBLE_DEVICES=0
+      # App config (can be overridden via .env)
+      - CONFIG_PATH=/app/config/config.yaml
+      - LOG_LEVEL=INFO
+      - LOG_FORMAT=json
+    volumes:
+      - models_volume:/app/models
+      - data_volume:/app/data
+      - known_voices_volume:/app/known_voices
+      - qdrant_storage_volume:/app/qdrant_storage
+      - ./config:/app/config:ro
+      - ./scripts:/app/scripts:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+        limits:
+          memory: 24G  # Adjust to your GPU VRAM + system RAM headroom
+    restart: "on-failure:5"
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/scripts/healthcheck.sh"]
+      interval: 30s
+      timeout: 30s
+      start_period: 180s  # Warmup can take 2-3 minutes on cold start
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Qdrant — Vector Database (persistent, not in-memory!)
+  # ---------------------------------------------------------------------------
+  qdrant:
+    image: qdrant/qdrant:v1.10.0
+    container_name: speaker-id-qdrant
+    ports:
+      - "6333:6333"   # HTTP API
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant_storage_volume:/qdrant/storage
+      - qdrant_snapshots_volume:/qdrant/snapshots
+    environment:
+      - QDRANT__SERVICE__HTTP_PORT=6333
+      - QDRANT__SERVICE__GRPC_PORT=6334
+      - QDRANT__STORAGE__PERFORMANCE__MEMORY_MAPPED_THRESHOLD=100000
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Redis — Distributed locks, idempotency keys, simple cache
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7.2-alpine
+    container_name: speaker-id-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_volume:/data
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 5
+
+# -----------------------------------------------------------------------------
+# Named volumes (persist across container recreation)
+# -----------------------------------------------------------------------------
+volumes:
+  models_volume:
+    driver: local
+  data_volume:
+    driver: local
+  known_voices_volume:
+    driver: local
+  qdrant_storage_volume:
+    driver: local
+  qdrant_snapshots_volume:
+    driver: local
+  redis_volume:
+    driver: local
+
+# -----------------------------------------------------------------------------
+# Networks
+# -----------------------------------------------------------------------------
+networks:
+  default:
+    name: speaker-id-net
+    driver: bridge

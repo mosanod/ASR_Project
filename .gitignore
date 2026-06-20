@@ -1,0 +1,65 @@
+# =============================================================================
+# Speaker-ID ASR Pipeline — Git Ignore
+# =============================================================================
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.venv/
+venv/
+env/
+ENV/
+
+# Project data (never commit)
+/app/models/
+/app/data/
+/app/known_voices/
+/app/qdrant_storage/
+/app/qdrant_snapshots/
+/data/
+/models/
+/known_voices/
+/qdrant_storage/
+/output/
+/logs/
+*.log
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml
+
+# Large model files (downloaded at runtime)
+*.gguf
+*.bin
+*.pt
+*.pth
+*.safetensors
+*.nemo
+
+# Temporary
+/tmp/
+/var/tmp/
+*.tmp
+*.temp
